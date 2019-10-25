@@ -78,7 +78,7 @@ istio-ingressgateway:
     name: https-kiali
   - port: 15030
     targetPort: 15030
-    name: https-prometheus
+    name: https-prom
   - port: 15031
     targetPort: 15031
     name: https-grafana

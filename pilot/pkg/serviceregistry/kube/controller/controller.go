@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -28,6 +29,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	discoveryv1alpha1 "k8s.io/api/discovery/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -457,12 +459,16 @@ func (c *Controller) InstancesByPort(svc *model.Service, reqSvcPort int,
 	}
 
 	if features.EnableEndpointSliceController {
-		item, exists, err := c.endpointslices.informer.GetStore().GetByKey(kube.KeyFunc(svc.Attributes.Name, svc.Attributes.Namespace))
+		esLabelSelector := klabels.Set(map[string]string{discoveryv1alpha1.LabelServiceName: svc.Attributes.Name}).AsSelectorPreValidated()
+		var slices []*discoveryv1alpha1.EndpointSlice
+		err := cache.ListAllByNamespace(c.endpointslices.informer.GetIndexer(), svc.Attributes.Namespace, esLabelSelector, func(i interface{}) {
+			slices = append(slices, i.(*discoveryv1alpha1.EndpointSlice))
+		})
 		if err != nil {
 			log.Infof("get endpoint(%s, %s) => error %v", svc.Attributes.Name, svc.Attributes.Namespace, err)
 			return nil, nil
 		}
-		if !exists {
+		if len(slices) == 0 {
 			return nil, nil
 		}
 
@@ -472,52 +478,56 @@ func (c *Controller) InstancesByPort(svc *model.Service, reqSvcPort int,
 		if !exists {
 			return nil, nil
 		}
-		slice := item.(*discoveryv1alpha1.EndpointSlice)
+
 		var out []*model.ServiceInstance
-		for _, e := range slice.Endpoints {
-			for _, a := range e.Addresses {
-				var podLabels labels.Instance
-				pod := c.pods.getPodByIP(a)
-				if pod != nil {
-					podLabels = configKube.ConvertLabels(pod.ObjectMeta)
-				}
-				// check that one of the input labels is a subset of the labels
-				if !labelsList.HasSubsetOf(podLabels) {
-					continue
-				}
-
-				az, sa, uid := "", "", ""
-				if pod != nil {
-					az = c.GetPodLocality(pod)
-					sa = kube.SecureNamingSAN(pod)
-					if mixerEnabled {
-						uid = fmt.Sprintf("kubernetes://%s.%s", pod.Name, pod.Namespace)
+		for _, slice := range slices {
+			for _, e := range slice.Endpoints {
+				for _, a := range e.Addresses {
+					var podLabels labels.Instance
+					pod := c.pods.getPodByIP(a)
+					if pod != nil {
+						podLabels = configKube.ConvertLabels(pod.ObjectMeta)
 					}
-				}
-				mtlsReady := kube.PodMTLSReady(pod)
-
-				// identify the port by name. K8S EndpointPort uses the service port name
-				for _, port := range slice.Ports {
-					var portNum uint32
-					if port.Port != nil {
-						portNum = uint32(*port.Port)
+					// check that one of the input labels is a subset of the labels
+					if !labelsList.HasSubsetOf(podLabels) {
+						continue
 					}
-					if port.Name == nil ||
-						svcPortEntry.Name == *port.Name {
-						out = append(out, &model.ServiceInstance{
-							Endpoint: model.NetworkEndpoint{
-								Address:     a,
-								Port:        int(portNum),
-								ServicePort: svcPortEntry,
-								UID:         uid,
-								Network:     c.endpointNetwork(a),
-								Locality:    az,
-							},
-							Service:        svc,
-							Labels:         podLabels,
-							ServiceAccount: sa,
-							MTLSReady:      mtlsReady,
-						})
+
+					az, sa, uid := "", "", ""
+					if pod != nil {
+						az = c.GetPodLocality(pod)
+						sa = kube.SecureNamingSAN(pod)
+						if mixerEnabled {
+							uid = fmt.Sprintf("kubernetes://%s.%s", pod.Name, pod.Namespace)
+						}
+					}
+					mtlsReady := kube.PodMTLSReady(pod)
+
+					// identify the port by name. K8S EndpointPort uses the service port name
+					for _, port := range slice.Ports {
+						var portNum uint32
+						if port.Port != nil {
+							portNum = uint32(*port.Port)
+						}
+
+						if port.Name == nil ||
+							svcPortEntry.Name == *port.Name {
+
+							out = append(out, &model.ServiceInstance{
+								Endpoint: model.NetworkEndpoint{
+									Address:     a,
+									Port:        int(portNum),
+									ServicePort: svcPortEntry,
+									UID:         uid,
+									Network:     c.endpointNetwork(a),
+									Locality:    az,
+								},
+								Service:        svc,
+								Labels:         podLabels,
+								ServiceAccount: sa,
+								MTLSReady:      mtlsReady,
+							})
+						}
 					}
 				}
 			}
@@ -1101,7 +1111,7 @@ func (c *Controller) updateEDSSlice(slice *discoveryv1alpha1.EndpointSlice, even
 	svcName := slice.Labels[discoveryv1alpha1.LabelServiceName]
 	hostname := kube.ServiceHostname(svcName, slice.Namespace, c.domainSuffix)
 	mixerEnabled := c.Env != nil && c.Env.Mesh != nil && (c.Env.Mesh.MixerCheckServer != "" || c.Env.Mesh.MixerReportServer != "")
-
+	log.Errorf("howardjohn: Slice update event: %v/%v", hostname, event)
 	endpoints := make([]*model.IstioEndpoint, 0)
 	if event != model.EventDelete {
 		for _, e := range slice.Endpoints {
@@ -1111,6 +1121,8 @@ func (c *Controller) updateEDSSlice(slice *discoveryv1alpha1.EndpointSlice, even
 					// This can not happen in usual case
 					if e.TargetRef != nil && e.TargetRef.Kind == "Pod" {
 						log.Warnf("Endpoint without pod %s %s.%s", a, svcName, slice.Namespace)
+						debug, _ := json.MarshalIndent(slice.Endpoints, "howardjohn", "  ")
+						log.Errorf("howardjohn: %s", debug)
 						if c.Env != nil {
 							c.Env.PushContext.Add(model.EndpointNoPod, string(hostname), nil, a)
 						}
