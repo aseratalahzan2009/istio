@@ -24,7 +24,6 @@ import (
 	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
 	"github.com/golang/protobuf/ptypes/wrappers"
-
 	networkingapi "istio.io/api/networking/v1alpha3"
 
 	"istio.io/istio/pilot/pkg/model"

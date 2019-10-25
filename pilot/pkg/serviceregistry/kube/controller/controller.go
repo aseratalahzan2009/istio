@@ -26,6 +26,7 @@ import (
 
 	"github.com/yl2chen/cidranger"
 	v1 "k8s.io/api/core/v1"
+	discoveryv1alpha1 "k8s.io/api/discovery/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/informers"
@@ -112,11 +113,12 @@ type Options struct {
 type Controller struct {
 	domainSuffix string
 
-	client    kubernetes.Interface
-	queue     kube.Queue
-	services  cacheHandler
-	endpoints cacheHandler
-	nodes     cacheHandler
+	client         kubernetes.Interface
+	queue          kube.Queue
+	services       cacheHandler
+	endpoints      cacheHandler
+	endpointslices cacheHandler
+	nodes          cacheHandler
 
 	pods *PodCache
 
@@ -172,8 +174,13 @@ func NewController(client kubernetes.Interface, options Options) *Controller {
 	svcInformer := sharedInformers.Core().V1().Services().Informer()
 	out.services = out.createCacheHandler(svcInformer, "Services")
 
-	epInformer := sharedInformers.Core().V1().Endpoints().Informer()
-	out.endpoints = out.createEDSCacheHandler(epInformer, "Endpoints")
+	if features.EnableEndpointSliceController {
+		epSliceInformer := sharedInformers.Discovery().V1alpha1().EndpointSlices().Informer()
+		out.endpointslices = out.createCacheHandler(epSliceInformer, "EndpointsSlice")
+	} else {
+		epInformer := sharedInformers.Core().V1().Endpoints().Informer()
+		out.endpoints = out.createEDSCacheHandler(epInformer, "Endpoints")
+	}
 
 	nodeInformer := sharedInformers.Core().V1().Nodes().Informer()
 	out.nodes = out.createCacheHandler(nodeInformer, "Nodes")
@@ -263,8 +270,14 @@ func (c *Controller) createEDSCacheHandler(informer cache.SharedIndexInformer, o
 
 // HasSynced returns true after the initial state synchronization
 func (c *Controller) HasSynced() bool {
+	var endpointsSynced bool
+	if features.EnableEndpointSliceController {
+		endpointsSynced = c.endpointslices.informer.HasSynced()
+	} else {
+		endpointsSynced = c.endpoints.informer.HasSynced()
+	}
 	if !c.services.informer.HasSynced() ||
-		!c.endpoints.informer.HasSynced() ||
+		!endpointsSynced ||
 		!c.pods.informer.HasSynced() ||
 		!c.nodes.informer.HasSynced() {
 		return false
@@ -287,7 +300,11 @@ func (c *Controller) Run(stop <-chan struct{}) {
 	cache.WaitForCacheSync(stop, c.nodes.informer.HasSynced, c.pods.informer.HasSynced,
 		c.services.informer.HasSynced)
 
-	go c.endpoints.informer.Run(stop)
+	if features.EnableEndpointSliceController {
+		go c.endpointslices.informer.Run(stop)
+	} else {
+		go c.endpoints.informer.Run(stop)
+	}
 
 	<-stop
 	log.Infof("Controller terminated")
@@ -439,69 +456,138 @@ func (c *Controller) InstancesByPort(svc *model.Service, reqSvcPort int,
 		return inScopeInstances, nil
 	}
 
-	item, exists, err := c.endpoints.informer.GetStore().GetByKey(kube.KeyFunc(svc.Attributes.Name, svc.Attributes.Namespace))
-	if err != nil {
-		log.Infof("get endpoint(%s, %s) => error %v", svc.Attributes.Name, svc.Attributes.Namespace, err)
-		return nil, nil
-	}
-	if !exists {
-		return nil, nil
-	}
+	if features.EnableEndpointSliceController {
+		item, exists, err := c.endpointslices.informer.GetStore().GetByKey(kube.KeyFunc(svc.Attributes.Name, svc.Attributes.Namespace))
+		if err != nil {
+			log.Infof("get endpoint(%s, %s) => error %v", svc.Attributes.Name, svc.Attributes.Namespace, err)
+			return nil, nil
+		}
+		if !exists {
+			return nil, nil
+		}
 
-	mixerEnabled := c.Env != nil && c.Env.Mesh != nil && (c.Env.Mesh.MixerCheckServer != "" || c.Env.Mesh.MixerReportServer != "")
-	// Locate all ports in the actual service
-	svcPortEntry, exists := svc.Ports.GetByPort(reqSvcPort)
-	if !exists {
-		return nil, nil
-	}
-	ep := item.(*v1.Endpoints)
-	var out []*model.ServiceInstance
-	for _, ss := range ep.Subsets {
-		for _, ea := range ss.Addresses {
-			var podLabels labels.Instance
-			pod := c.pods.getPodByIP(ea.IP)
-			if pod != nil {
-				podLabels = configKube.ConvertLabels(pod.ObjectMeta)
-			}
-			// check that one of the input labels is a subset of the labels
-			if !labelsList.HasSubsetOf(podLabels) {
-				continue
-			}
-
-			az, sa, uid := "", "", ""
-			if pod != nil {
-				az = c.GetPodLocality(pod)
-				sa = kube.SecureNamingSAN(pod)
-				if mixerEnabled {
-					uid = fmt.Sprintf("kubernetes://%s.%s", pod.Name, pod.Namespace)
+		mixerEnabled := c.Env != nil && c.Env.Mesh != nil && (c.Env.Mesh.MixerCheckServer != "" || c.Env.Mesh.MixerReportServer != "")
+		// Locate all ports in the actual service
+		svcPortEntry, exists := svc.Ports.GetByPort(reqSvcPort)
+		if !exists {
+			return nil, nil
+		}
+		slice := item.(*discoveryv1alpha1.EndpointSlice)
+		var out []*model.ServiceInstance
+		for _, e := range slice.Endpoints {
+			for _, a := range e.Addresses {
+				var podLabels labels.Instance
+				pod := c.pods.getPodByIP(a)
+				if pod != nil {
+					podLabels = configKube.ConvertLabels(pod.ObjectMeta)
 				}
-			}
-			mtlsReady := kube.PodMTLSReady(pod)
+				// check that one of the input labels is a subset of the labels
+				if !labelsList.HasSubsetOf(podLabels) {
+					continue
+				}
 
-			// identify the port by name. K8S EndpointPort uses the service port name
-			for _, port := range ss.Ports {
-				if port.Name == "" || // 'name optional if single port is defined'
-					svcPortEntry.Name == port.Name {
-					out = append(out, &model.ServiceInstance{
-						Endpoint: model.NetworkEndpoint{
-							Address:     ea.IP,
-							Port:        int(port.Port),
-							ServicePort: svcPortEntry,
-							UID:         uid,
-							Network:     c.endpointNetwork(ea.IP),
-							Locality:    az,
-						},
-						Service:        svc,
-						Labels:         podLabels,
-						ServiceAccount: sa,
-						MTLSReady:      mtlsReady,
-					})
+				az, sa, uid := "", "", ""
+				if pod != nil {
+					az = c.GetPodLocality(pod)
+					sa = kube.SecureNamingSAN(pod)
+					if mixerEnabled {
+						uid = fmt.Sprintf("kubernetes://%s.%s", pod.Name, pod.Namespace)
+					}
+				}
+				mtlsReady := kube.PodMTLSReady(pod)
+
+				// identify the port by name. K8S EndpointPort uses the service port name
+				for _, port := range slice.Ports {
+					var portNum uint32
+					if port.Port != nil {
+						portNum = uint32(*port.Port)
+					}
+					if port.Name == nil ||
+						svcPortEntry.Name == *port.Name {
+						out = append(out, &model.ServiceInstance{
+							Endpoint: model.NetworkEndpoint{
+								Address:     a,
+								Port:        int(portNum),
+								ServicePort: svcPortEntry,
+								UID:         uid,
+								Network:     c.endpointNetwork(a),
+								Locality:    az,
+							},
+							Service:        svc,
+							Labels:         podLabels,
+							ServiceAccount: sa,
+							MTLSReady:      mtlsReady,
+						})
+					}
 				}
 			}
 		}
-	}
+		return out, nil
+	} else {
+		item, exists, err := c.endpoints.informer.GetStore().GetByKey(kube.KeyFunc(svc.Attributes.Name, svc.Attributes.Namespace))
+		if err != nil {
+			log.Infof("get endpoint(%s, %s) => error %v", svc.Attributes.Name, svc.Attributes.Namespace, err)
+			return nil, nil
+		}
+		if !exists {
+			return nil, nil
+		}
 
-	return out, nil
+		mixerEnabled := c.Env != nil && c.Env.Mesh != nil && (c.Env.Mesh.MixerCheckServer != "" || c.Env.Mesh.MixerReportServer != "")
+		// Locate all ports in the actual service
+		svcPortEntry, exists := svc.Ports.GetByPort(reqSvcPort)
+		if !exists {
+			return nil, nil
+		}
+		ep := item.(*v1.Endpoints)
+		var out []*model.ServiceInstance
+		for _, ss := range ep.Subsets {
+			for _, ea := range ss.Addresses {
+				var podLabels labels.Instance
+				pod := c.pods.getPodByIP(ea.IP)
+				if pod != nil {
+					podLabels = configKube.ConvertLabels(pod.ObjectMeta)
+				}
+				// check that one of the input labels is a subset of the labels
+				if !labelsList.HasSubsetOf(podLabels) {
+					continue
+				}
+
+				az, sa, uid := "", "", ""
+				if pod != nil {
+					az = c.GetPodLocality(pod)
+					sa = kube.SecureNamingSAN(pod)
+					if mixerEnabled {
+						uid = fmt.Sprintf("kubernetes://%s.%s", pod.Name, pod.Namespace)
+					}
+				}
+				mtlsReady := kube.PodMTLSReady(pod)
+
+				// identify the port by name. K8S EndpointPort uses the service port name
+				for _, port := range ss.Ports {
+					if port.Name == "" || // 'name optional if single port is defined'
+						svcPortEntry.Name == port.Name {
+						out = append(out, &model.ServiceInstance{
+							Endpoint: model.NetworkEndpoint{
+								Address:     ea.IP,
+								Port:        int(port.Port),
+								ServicePort: svcPortEntry,
+								UID:         uid,
+								Network:     c.endpointNetwork(ea.IP),
+								Locality:    az,
+							},
+							Service:        svc,
+							Labels:         podLabels,
+							ServiceAccount: sa,
+							MTLSReady:      mtlsReady,
+						})
+					}
+				}
+			}
+		}
+
+		return out, nil
+	}
 }
 
 // GetProxyServiceInstances returns service instances co-located with a given proxy
@@ -548,14 +634,19 @@ func (c *Controller) GetProxyServiceInstances(proxy *model.Proxy) ([]*model.Serv
 		// 3. Headless service
 		endpointsForPodInSameNS := make([]*model.ServiceInstance, 0)
 		endpointsForPodInDifferentNS := make([]*model.ServiceInstance, 0)
-		for _, item := range c.endpoints.informer.GetStore().List() {
-			ep := *item.(*v1.Endpoints)
-			endpoints := &endpointsForPodInSameNS
-			if ep.Namespace != proxyNamespace {
-				endpoints = &endpointsForPodInDifferentNS
-			}
+		// TODO(howardjohn)
+		if features.EnableEndpointSliceController {
 
-			*endpoints = append(*endpoints, c.getProxyServiceInstancesByEndpoint(ep, proxy)...)
+		} else {
+			for _, item := range c.endpoints.informer.GetStore().List() {
+				ep := *item.(*v1.Endpoints)
+				endpoints := &endpointsForPodInSameNS
+				if ep.Namespace != proxyNamespace {
+					endpoints = &endpointsForPodInDifferentNS
+				}
+
+				*endpoints = append(*endpoints, c.getProxyServiceInstancesByEndpoint(ep, proxy)...)
+			}
 		}
 
 		// Put the endpointsForPodInSameNS in front of endpointsForPodInDifferentNS so that Pilot will
@@ -871,28 +962,53 @@ func (c *Controller) AppendServiceHandler(f func(*model.Service, model.Event)) e
 
 // AppendInstanceHandler implements a service catalog operation
 func (c *Controller) AppendInstanceHandler(f func(*model.ServiceInstance, model.Event)) error {
-	if c.endpoints.handler == nil {
-		return nil
-	}
-	c.endpoints.handler.Append(func(obj interface{}, event model.Event) error {
-		ep, ok := obj.(*v1.Endpoints)
-		if !ok {
-			tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-			if !ok {
-				log.Errorf("Couldn't get object from tombstone %#v", obj)
-				return nil
-			}
-			ep, ok = tombstone.Obj.(*v1.Endpoints)
-			if !ok {
-				log.Errorf("Tombstone contained an object that is not an endpoint %#v", obj)
-				return nil
-			}
+	if features.EnableEndpointSliceController {
+		if c.endpointslices.handler == nil {
+			return nil
 		}
+		c.endpointslices.handler.Append(func(obj interface{}, event model.Event) error {
+			ep, ok := obj.(*discoveryv1alpha1.EndpointSlice)
+			if !ok {
+				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					log.Errorf("Couldn't get object from tombstone %#v", obj)
+					return nil
+				}
+				ep, ok = tombstone.Obj.(*discoveryv1alpha1.EndpointSlice)
+				if !ok {
+					log.Errorf("Tombstone contained an object that is not an endpoint slice %#v", obj)
+					return nil
+				}
+			}
 
-		c.updateEDS(ep, event)
+			c.updateEDSSlice(ep, event)
 
-		return nil
-	})
+			return nil
+		})
+	} else {
+		if c.endpoints.handler == nil {
+			return nil
+		}
+		c.endpoints.handler.Append(func(obj interface{}, event model.Event) error {
+			ep, ok := obj.(*v1.Endpoints)
+			if !ok {
+				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					log.Errorf("Couldn't get object from tombstone %#v", obj)
+					return nil
+				}
+				ep, ok = tombstone.Obj.(*v1.Endpoints)
+				if !ok {
+					log.Errorf("Tombstone contained object that is not an endpoint %#v", obj)
+					return nil
+				}
+			}
+
+			c.updateEDS(ep, event)
+
+			return nil
+		})
+	}
 
 	return nil
 }
@@ -979,6 +1095,91 @@ func (c *Controller) updateEDS(ep *v1.Endpoints, event model.Event) {
 	}
 
 	_ = c.XDSUpdater.EDSUpdate(c.ClusterID, string(hostname), ep.Namespace, endpoints)
+}
+
+func (c *Controller) updateEDSSlice(slice *discoveryv1alpha1.EndpointSlice, event model.Event) {
+	svcName := slice.Labels[discoveryv1alpha1.LabelServiceName]
+	hostname := kube.ServiceHostname(svcName, slice.Namespace, c.domainSuffix)
+	mixerEnabled := c.Env != nil && c.Env.Mesh != nil && (c.Env.Mesh.MixerCheckServer != "" || c.Env.Mesh.MixerReportServer != "")
+
+	endpoints := make([]*model.IstioEndpoint, 0)
+	if event != model.EventDelete {
+		for _, e := range slice.Endpoints {
+			for _, a := range e.Addresses {
+				pod := c.pods.getPodByIP(a)
+				if pod == nil {
+					// This can not happen in usual case
+					if e.TargetRef != nil && e.TargetRef.Kind == "Pod" {
+						log.Warnf("Endpoint without pod %s %s.%s", a, svcName, slice.Namespace)
+						if c.Env != nil {
+							c.Env.PushContext.Add(model.EndpointNoPod, string(hostname), nil, a)
+						}
+						// TODO: keep them in a list, and check when pod events happen !
+						continue
+					}
+					// For service without selector, maybe there are no related pods
+				}
+
+				var labels map[string]string
+				locality, sa, uid := "", "", ""
+				if pod != nil {
+					locality = c.GetPodLocality(pod)
+					sa = kube.SecureNamingSAN(pod)
+					if mixerEnabled {
+						uid = fmt.Sprintf("kubernetes://%s.%s", pod.Name, pod.Namespace)
+					}
+					labels = configKube.ConvertLabels(pod.ObjectMeta)
+				}
+
+				// EDS and ServiceEntry use name for service port - ADS will need to
+				// map to numbers.
+				for _, port := range slice.Ports {
+					var portNum uint32
+					if port.Port != nil {
+						portNum = uint32(*port.Port)
+					}
+					var portName string
+					if port.Name != nil {
+						portName = *port.Name
+					}
+					endpoints = append(endpoints, &model.IstioEndpoint{
+						Address:         a,
+						EndpointPort:    portNum,
+						ServicePortName: portName,
+						Labels:          labels,
+						UID:             uid,
+						ServiceAccount:  sa,
+						Network:         c.endpointNetwork(a),
+						Locality:        locality,
+						Attributes:      model.ServiceAttributes{Name: svcName, Namespace: slice.Namespace},
+					})
+				}
+			}
+		}
+	}
+
+	if log.InfoEnabled() {
+		var addresses []string
+		for _, ss := range slice.Endpoints {
+			for _, a := range ss.Addresses {
+				addresses = append(addresses, a)
+			}
+		}
+		log.Infof("Handle EDS endpoint %s in namespace %s -> %v", svcName, slice.Namespace, addresses)
+	}
+
+	if features.EnableHeadlessService.Get() {
+		if obj, _, _ := c.services.informer.GetIndexer().GetByKey(kube.KeyFunc(svcName, slice.Namespace)); obj != nil {
+			svc := obj.(*v1.Service)
+			// if the service is headless service, trigger a full push.
+			if svc.Spec.ClusterIP == v1.ClusterIPNone {
+				c.XDSUpdater.ConfigUpdate(&model.PushRequest{Full: true, NamespacesUpdated: map[string]struct{}{slice.Namespace: {}}})
+				return
+			}
+		}
+	}
+
+	_ = c.XDSUpdater.EDSUpdate(c.ClusterID, string(hostname), slice.Namespace, endpoints)
 }
 
 // namedRangerEntry for holding network's CIDR and name
