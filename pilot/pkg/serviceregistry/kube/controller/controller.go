@@ -178,7 +178,9 @@ func NewController(client kubernetes.Interface, options Options) *Controller {
 
 	if features.EnableEndpointSliceController {
 		epSliceInformer := sharedInformers.Discovery().V1alpha1().EndpointSlices().Informer()
-		out.endpointslices = out.createCacheHandler(epSliceInformer, "EndpointsSlice")
+		// TODO Endpoints has a special handler, to filter out irrelevant updates to kube-system
+		// Investigate if we need this, or if EndpointSlice is makes this not relevant
+		out.endpointslices = out.createCacheHandler(epSliceInformer, "EndpointSlice")
 	} else {
 		epInformer := sharedInformers.Core().V1().Endpoints().Informer()
 		out.endpoints = out.createEDSCacheHandler(epInformer, "Endpoints")
