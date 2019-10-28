@@ -15,7 +15,6 @@
 package controller
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -29,7 +28,6 @@ import (
 	v1 "k8s.io/api/core/v1"
 	discoveryv1alpha1 "k8s.io/api/discovery/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -115,12 +113,11 @@ type Options struct {
 type Controller struct {
 	domainSuffix string
 
-	client         kubernetes.Interface
-	queue          kube.Queue
-	services       cacheHandler
-	endpoints      cacheHandler
-	endpointslices cacheHandler
-	nodes          cacheHandler
+	client    kubernetes.Interface
+	queue     kube.Queue
+	services  cacheHandler
+	endpoints edsController
+	nodes     cacheHandler
 
 	pods *PodCache
 
@@ -177,13 +174,9 @@ func NewController(client kubernetes.Interface, options Options) *Controller {
 	out.services = out.createCacheHandler(svcInformer, "Services")
 
 	if features.EnableEndpointSliceController {
-		epSliceInformer := sharedInformers.Discovery().V1alpha1().EndpointSlices().Informer()
-		// TODO Endpoints has a special handler, to filter out irrelevant updates to kube-system
-		// Investigate if we need this, or if EndpointSlice is makes this not relevant
-		out.endpointslices = out.createCacheHandler(epSliceInformer, "EndpointSlice")
+		out.endpoints = NewEndpointSliceController(out, sharedInformers)
 	} else {
-		epInformer := sharedInformers.Core().V1().Endpoints().Informer()
-		out.endpoints = out.createEDSCacheHandler(epInformer, "Endpoints")
+		out.endpoints = NewEndpointsController(out, sharedInformers)
 	}
 
 	nodeInformer := sharedInformers.Core().V1().Nodes().Informer()
@@ -237,51 +230,10 @@ func (c *Controller) createCacheHandler(informer cache.SharedIndexInformer, otyp
 	return cacheHandler{informer: informer, handler: handler}
 }
 
-func (c *Controller) createEDSCacheHandler(informer cache.SharedIndexInformer, otype string) cacheHandler {
-	handler := &kube.ChainHandler{Funcs: []kube.Handler{c.notify}}
-
-	informer.AddEventHandler(
-		cache.ResourceEventHandlerFuncs{
-			// TODO: filtering functions to skip over un-referenced resources (perf)
-			AddFunc: func(obj interface{}) {
-				incrementEvent(otype, "add")
-				c.queue.Push(kube.Task{Handler: handler.Apply, Obj: obj, Event: model.EventAdd})
-			},
-			UpdateFunc: func(old, cur interface{}) {
-				// Avoid pushes if only resource version changed (kube-scheduller, cluster-autoscaller, etc)
-				oldE := old.(*v1.Endpoints)
-				curE := cur.(*v1.Endpoints)
-
-				if !reflect.DeepEqual(oldE.Subsets, curE.Subsets) {
-					incrementEvent(otype, "update")
-					c.queue.Push(kube.Task{Handler: handler.Apply, Obj: cur, Event: model.EventUpdate})
-				} else {
-					incrementEvent(otype, "updatesame")
-				}
-			},
-			DeleteFunc: func(obj interface{}) {
-				incrementEvent(otype, "delete")
-				// Deleting the endpoints results in an empty set from EDS perspective - only
-				// deleting the service should delete the resources. The full sync replaces the
-				// maps.
-				// c.updateEDS(obj.(*v1.Endpoints))
-				c.queue.Push(kube.Task{Handler: handler.Apply, Obj: obj, Event: model.EventDelete})
-			},
-		})
-
-	return cacheHandler{informer: informer, handler: handler}
-}
-
 // HasSynced returns true after the initial state synchronization
 func (c *Controller) HasSynced() bool {
-	var endpointsSynced bool
-	if features.EnableEndpointSliceController {
-		endpointsSynced = c.endpointslices.informer.HasSynced()
-	} else {
-		endpointsSynced = c.endpoints.informer.HasSynced()
-	}
 	if !c.services.informer.HasSynced() ||
-		!endpointsSynced ||
+		!c.endpoints.Get().informer.HasSynced() ||
 		!c.pods.informer.HasSynced() ||
 		!c.nodes.informer.HasSynced() {
 		return false
@@ -304,11 +256,7 @@ func (c *Controller) Run(stop <-chan struct{}) {
 	cache.WaitForCacheSync(stop, c.nodes.informer.HasSynced, c.pods.informer.HasSynced,
 		c.services.informer.HasSynced)
 
-	if features.EnableEndpointSliceController {
-		go c.endpointslices.informer.Run(stop)
-	} else {
-		go c.endpoints.informer.Run(stop)
-	}
+	go c.endpoints.Get().informer.Run(stop)
 
 	<-stop
 	log.Infof("Controller terminated")
@@ -460,146 +408,7 @@ func (c *Controller) InstancesByPort(svc *model.Service, reqSvcPort int,
 		return inScopeInstances, nil
 	}
 
-	if features.EnableEndpointSliceController {
-		esLabelSelector := klabels.Set(map[string]string{discoveryv1alpha1.LabelServiceName: svc.Attributes.Name}).AsSelectorPreValidated()
-		var slices []*discoveryv1alpha1.EndpointSlice
-		err := cache.ListAllByNamespace(c.endpointslices.informer.GetIndexer(), svc.Attributes.Namespace, esLabelSelector, func(i interface{}) {
-			slices = append(slices, i.(*discoveryv1alpha1.EndpointSlice))
-		})
-		if err != nil {
-			log.Infof("get endpoint(%s, %s) => error %v", svc.Attributes.Name, svc.Attributes.Namespace, err)
-			return nil, nil
-		}
-		if len(slices) == 0 {
-			return nil, nil
-		}
-
-		mixerEnabled := c.Env != nil && c.Env.Mesh != nil && (c.Env.Mesh.MixerCheckServer != "" || c.Env.Mesh.MixerReportServer != "")
-		// Locate all ports in the actual service
-		svcPortEntry, exists := svc.Ports.GetByPort(reqSvcPort)
-		if !exists {
-			return nil, nil
-		}
-
-		var out []*model.ServiceInstance
-		for _, slice := range slices {
-			for _, e := range slice.Endpoints {
-				for _, a := range e.Addresses {
-					var podLabels labels.Instance
-					pod := c.pods.getPodByIP(a)
-					if pod != nil {
-						podLabels = configKube.ConvertLabels(pod.ObjectMeta)
-					}
-					// check that one of the input labels is a subset of the labels
-					if !labelsList.HasSubsetOf(podLabels) {
-						continue
-					}
-
-					az, sa, uid := "", "", ""
-					if pod != nil {
-						az = c.GetPodLocality(pod)
-						sa = kube.SecureNamingSAN(pod)
-						if mixerEnabled {
-							uid = fmt.Sprintf("kubernetes://%s.%s", pod.Name, pod.Namespace)
-						}
-					}
-					mtlsReady := kube.PodMTLSReady(pod)
-
-					// identify the port by name. K8S EndpointPort uses the service port name
-					for _, port := range slice.Ports {
-						var portNum uint32
-						if port.Port != nil {
-							portNum = uint32(*port.Port)
-						}
-
-						if port.Name == nil ||
-							svcPortEntry.Name == *port.Name {
-
-							out = append(out, &model.ServiceInstance{
-								Endpoint: model.NetworkEndpoint{
-									Address:     a,
-									Port:        int(portNum),
-									ServicePort: svcPortEntry,
-									UID:         uid,
-									Network:     c.endpointNetwork(a),
-									Locality:    az,
-								},
-								Service:        svc,
-								Labels:         podLabels,
-								ServiceAccount: sa,
-								MTLSReady:      mtlsReady,
-							})
-						}
-					}
-				}
-			}
-		}
-		return out, nil
-	} else {
-		item, exists, err := c.endpoints.informer.GetStore().GetByKey(kube.KeyFunc(svc.Attributes.Name, svc.Attributes.Namespace))
-		if err != nil {
-			log.Infof("get endpoint(%s, %s) => error %v", svc.Attributes.Name, svc.Attributes.Namespace, err)
-			return nil, nil
-		}
-		if !exists {
-			return nil, nil
-		}
-
-		mixerEnabled := c.Env != nil && c.Env.Mesh != nil && (c.Env.Mesh.MixerCheckServer != "" || c.Env.Mesh.MixerReportServer != "")
-		// Locate all ports in the actual service
-		svcPortEntry, exists := svc.Ports.GetByPort(reqSvcPort)
-		if !exists {
-			return nil, nil
-		}
-		ep := item.(*v1.Endpoints)
-		var out []*model.ServiceInstance
-		for _, ss := range ep.Subsets {
-			for _, ea := range ss.Addresses {
-				var podLabels labels.Instance
-				pod := c.pods.getPodByIP(ea.IP)
-				if pod != nil {
-					podLabels = configKube.ConvertLabels(pod.ObjectMeta)
-				}
-				// check that one of the input labels is a subset of the labels
-				if !labelsList.HasSubsetOf(podLabels) {
-					continue
-				}
-
-				az, sa, uid := "", "", ""
-				if pod != nil {
-					az = c.GetPodLocality(pod)
-					sa = kube.SecureNamingSAN(pod)
-					if mixerEnabled {
-						uid = fmt.Sprintf("kubernetes://%s.%s", pod.Name, pod.Namespace)
-					}
-				}
-				mtlsReady := kube.PodMTLSReady(pod)
-
-				// identify the port by name. K8S EndpointPort uses the service port name
-				for _, port := range ss.Ports {
-					if port.Name == "" || // 'name optional if single port is defined'
-						svcPortEntry.Name == port.Name {
-						out = append(out, &model.ServiceInstance{
-							Endpoint: model.NetworkEndpoint{
-								Address:     ea.IP,
-								Port:        int(port.Port),
-								ServicePort: svcPortEntry,
-								UID:         uid,
-								Network:     c.endpointNetwork(ea.IP),
-								Locality:    az,
-							},
-							Service:        svc,
-							Labels:         podLabels,
-							ServiceAccount: sa,
-							MTLSReady:      mtlsReady,
-						})
-					}
-				}
-			}
-		}
-
-		return out, nil
-	}
+	return c.endpoints.InstancesByPort(c, svc, reqSvcPort, labelsList)
 }
 
 // GetProxyServiceInstances returns service instances co-located with a given proxy
@@ -644,28 +453,7 @@ func (c *Controller) GetProxyServiceInstances(proxy *model.Proxy) ([]*model.Serv
 		}
 
 		// 3. Headless service
-		endpointsForPodInSameNS := make([]*model.ServiceInstance, 0)
-		endpointsForPodInDifferentNS := make([]*model.ServiceInstance, 0)
-		// TODO(howardjohn)
-		if features.EnableEndpointSliceController {
-
-		} else {
-			for _, item := range c.endpoints.informer.GetStore().List() {
-				ep := *item.(*v1.Endpoints)
-				endpoints := &endpointsForPodInSameNS
-				if ep.Namespace != proxyNamespace {
-					endpoints = &endpointsForPodInDifferentNS
-				}
-
-				*endpoints = append(*endpoints, c.getProxyServiceInstancesByEndpoint(ep, proxy)...)
-			}
-		}
-
-		// Put the endpointsForPodInSameNS in front of endpointsForPodInDifferentNS so that Pilot will
-		// first use endpoints from endpointsForPodInSameNS. This makes sure if there are two endpoints
-		// referring to the same IP/port, the one in endpointsForPodInSameNS will be used. (The other one
-		// in endpointsForPodInDifferentNS will thus be rejected by Pilot).
-		out = append(endpointsForPodInSameNS, endpointsForPodInDifferentNS...)
+		out = c.endpoints.GetEndpointServiceInstances(c, proxy, proxyNamespace)
 	}
 
 	if len(out) == 0 {
@@ -799,6 +587,46 @@ func (c *Controller) getProxyServiceInstancesByEndpoint(endpoints v1.Endpoints, 
 						out = append(out, c.getEndpoints(podIP, ip, port.Port, svcPort, svc))
 						if c.Env != nil {
 							c.Env.PushContext.Add(model.ProxyStatusEndpointNotReady, proxy.ID, proxy, "")
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return out
+}
+
+func (c *Controller) getProxyServiceInstancesByEndpointSlice(slice discoveryv1alpha1.EndpointSlice, proxy *model.Proxy) []*model.ServiceInstance {
+	out := make([]*model.ServiceInstance, 0)
+
+	hostname := kube.ServiceHostname(slice.Labels[discoveryv1alpha1.LabelServiceName], slice.Namespace, c.domainSuffix)
+	c.RLock()
+	svc := c.servicesMap[hostname]
+	c.RUnlock()
+
+	if svc != nil {
+		for _, port := range slice.Ports {
+			if port.Name == nil || port.Port == nil {
+				continue
+			}
+			svcPort, exists := svc.Ports.Get(*port.Name)
+			if !exists {
+				continue
+			}
+
+			podIP := proxy.IPAddresses[0]
+
+			// consider multiple IP scenarios
+			for _, ip := range proxy.IPAddresses {
+				for _, ep := range slice.Endpoints {
+					for _, a := range ep.Addresses {
+						if a == ip {
+							out = append(out, c.getEndpoints(podIP, ip, *port.Port, svcPort, svc))
+							// If the endpoint isn't ready, report this
+							if ep.Conditions.Ready != nil && !*ep.Conditions.Ready && c.Env != nil {
+								c.Env.PushContext.Add(model.ProxyStatusEndpointNotReady, proxy.ID, proxy, "")
+							}
 						}
 					}
 				}
@@ -974,54 +802,7 @@ func (c *Controller) AppendServiceHandler(f func(*model.Service, model.Event)) e
 
 // AppendInstanceHandler implements a service catalog operation
 func (c *Controller) AppendInstanceHandler(f func(*model.ServiceInstance, model.Event)) error {
-	if features.EnableEndpointSliceController {
-		if c.endpointslices.handler == nil {
-			return nil
-		}
-		c.endpointslices.handler.Append(func(obj interface{}, event model.Event) error {
-			ep, ok := obj.(*discoveryv1alpha1.EndpointSlice)
-			if !ok {
-				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-				if !ok {
-					log.Errorf("Couldn't get object from tombstone %#v", obj)
-					return nil
-				}
-				ep, ok = tombstone.Obj.(*discoveryv1alpha1.EndpointSlice)
-				if !ok {
-					log.Errorf("Tombstone contained an object that is not an endpoint slice %#v", obj)
-					return nil
-				}
-			}
-
-			c.updateEDSSlice(ep, event)
-
-			return nil
-		})
-	} else {
-		if c.endpoints.handler == nil {
-			return nil
-		}
-		c.endpoints.handler.Append(func(obj interface{}, event model.Event) error {
-			ep, ok := obj.(*v1.Endpoints)
-			if !ok {
-				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-				if !ok {
-					log.Errorf("Couldn't get object from tombstone %#v", obj)
-					return nil
-				}
-				ep, ok = tombstone.Obj.(*v1.Endpoints)
-				if !ok {
-					log.Errorf("Tombstone contained object that is not an endpoint %#v", obj)
-					return nil
-				}
-			}
-
-			c.updateEDS(ep, event)
-
-			return nil
-		})
-	}
-
+	c.endpoints.AppendInstanceHandler(c)
 	return nil
 }
 
@@ -1113,18 +894,21 @@ func (c *Controller) updateEDSSlice(slice *discoveryv1alpha1.EndpointSlice, even
 	svcName := slice.Labels[discoveryv1alpha1.LabelServiceName]
 	hostname := kube.ServiceHostname(svcName, slice.Namespace, c.domainSuffix)
 	mixerEnabled := c.Env != nil && c.Env.Mesh != nil && (c.Env.Mesh.MixerCheckServer != "" || c.Env.Mesh.MixerReportServer != "")
-	log.Errorf("howardjohn: Slice update event: %v/%v", hostname, event)
+
 	endpoints := make([]*model.IstioEndpoint, 0)
 	if event != model.EventDelete {
 		for _, e := range slice.Endpoints {
+			if e.Conditions.Ready != nil && !*e.Conditions.Ready {
+				// Ignore not ready endpoints
+				continue
+			}
 			for _, a := range e.Addresses {
 				pod := c.pods.getPodByIP(a)
 				if pod == nil {
 					// This can not happen in usual case
 					if e.TargetRef != nil && e.TargetRef.Kind == "Pod" {
 						log.Warnf("Endpoint without pod %s %s.%s", a, svcName, slice.Namespace)
-						debug, _ := json.MarshalIndent(slice.Endpoints, "howardjohn", "  ")
-						log.Errorf("howardjohn: %s", debug)
+
 						if c.Env != nil {
 							c.Env.PushContext.Add(model.EndpointNoPod, string(hostname), nil, a)
 						}
